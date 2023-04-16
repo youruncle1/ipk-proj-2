@@ -192,9 +192,17 @@ int main(int argc, char *argv[]) {
     server_address.sin_port = htons(std::atoi(port));
 
     if (bind(server_socket, (struct sockaddr *)&server_address, sizeof(server_address)) == -1) {
-        perror("bind");
+        perror("ERROR: bind");
         close(server_socket);
         return EXIT_FAILURE;
+    }
+
+        // Listen for incoming connections if in TCP mode.
+    if (strcmp(mode, "tcp") == 0) {
+        if (listen(server_socket, 5) < 0) {
+            perror("ERROR: listen() failed");
+            exit(EXIT_FAILURE);
+        }
     }
 
     /* Prepare signal handler */
@@ -202,9 +210,68 @@ int main(int argc, char *argv[]) {
 
     while (1) {
         if (strcmp(mode, "tcp") == 0) {
-            /* TODO */
-            return 0;
-        
+            struct sockaddr_in6 client_addr;
+            socklen_t client_addr_len = sizeof(client_addr);
+            int communication_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_addr_len);
+
+            if (communication_socket < 0) {
+                perror("accept() failed");
+                continue;
+            }
+
+            char buffer[MAX_RESPONSE_SIZE];
+            int res_len;
+
+            enum State {
+                AWAIT_HELLO,
+                AWAIT_SOLVE,
+                TERMINATE
+            } state = AWAIT_HELLO;
+
+            while (state != TERMINATE) {
+                res_len = recv(communication_socket, buffer, MAX_RESPONSE_SIZE, 0);
+
+                if (res_len <= 0) {
+                    state = TERMINATE;
+                    break;
+                }
+
+                buffer[res_len] = '\0';
+
+                switch (state) {
+                    case AWAIT_HELLO:
+                        if (strncmp(buffer, "HELLO\n", 6) == 0) {
+                            send(communication_socket, "HELLO\n", 6, 0);
+                            state = AWAIT_SOLVE;
+                        } else {
+                            state = TERMINATE;
+                        }
+                        break;
+                    case AWAIT_SOLVE:
+                        if (strncmp(buffer, "SOLVE ", 6) == 0) {
+                            long long result;
+                            if (evaluate_expression(&buffer[6], &result) == 0 && result >= 0) {
+                                char result_str[1024];
+                                snprintf(result_str, sizeof(result_str), "RESULT %lld\n", result);
+                                send(communication_socket, result_str, strlen(result_str), 0);
+                            } else {
+                                send(communication_socket, "BYE\n", 4, 0);
+                                state = TERMINATE;
+                            }
+                        } else if (strncmp(buffer, "BYE\n", 4) == 0) {
+                            state = TERMINATE;
+                        } else {
+                            state = TERMINATE;
+                        }
+                        break;
+                    default:
+                        state = TERMINATE;
+                }
+            }
+
+            send(communication_socket, "BYE\n", 4, 0);
+            close(communication_socket);
+
         } else if (strcmp(mode, "udp") == 0) {
             struct sockaddr_in client_addr;
             socklen_t client_addr_len = sizeof(client_addr);
@@ -230,7 +297,7 @@ int main(int argc, char *argv[]) {
                 long long result;
                 if (evaluate_expression((char *)&response_buffer[2], &result) == 0 && result >= 0) {
                     response_buffer[0] = 0x01; // Opcode: response
-                    response_buffer[1] = 0x00; // Status code: error
+                    response_buffer[1] = 0x00; // Status code: OK
                     //https://forum.arduino.cc/t/issues-creating-a-library-with-char-arrays/853215
                     response_length = snprintf((char *)&response_buffer[3], sizeof(response_buffer) - 3, "%lld", result);
                     response_buffer[2] = response_length;
