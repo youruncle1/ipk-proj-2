@@ -9,43 +9,33 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <netinet/in.h>
-#include <netdb.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <signal.h>
-#include <errno.h>
 #include <pthread.h>
 #include <ctype.h>
 #include <iostream>
 
-#define MAX_RESPONSE_SIZE 259
-#define MAX_CLIENTS 1024
+#define MAX_RESPONSE_SIZE 258 // maximum size of response message from client
+#define MAX_CLIENTS 128 // maximum number of simultenaously connected clients through TCP
 
 int server_socket; // server socket for signal handler has to be global
 int clients[MAX_CLIENTS]; // list of active TCP client sockets
 int num_clients = 0; // number of active TCP client sockets
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER; // mutex to protect access to the clients list
 
-
-void sigint_handler(int sig) {
-    (void) sig;
-
-    /* Close server socket (gracefully handles udp) */
-    close(server_socket);
-
-    /* Close connections with all active TCP clients (gracefully handles tcp) 
-       if the mode is udp, the num_clients is 0... 
-       mutex to ensure prevention of race conditions(see IOS)
-       (ensures no other thread can modify clients during this event)*/
-    pthread_mutex_lock(&clients_mutex);
-    for (int i = 0; i < num_clients; i++) {
-        send(clients[i], "BYE\n", 4, 0);
-        close(clients[i]);
-    }
-    pthread_mutex_unlock(&clients_mutex);
-
-    exit(EXIT_SUCCESS);
-}
+void parameter_check(int argc, char* argv[], const char **host, const char **port, const char **mode);
+char *parse_number(char *expr, long long *result);
+char *parse_operator(char *expr, char *op);
+char *parse_expr(char *expr, long long *result);
+long long evaluate_expression(char *expression, long long *result);
+void sigint_handler(int sig);
+void close_gracefully();
+int setup_socket(int *server_socket, const char *host, const char *port, const char *mode);
+void add_client(int client_socket);
+void remove_client(int client_socket);
+void *handle_tcp_client(void *arg);
+void handle_udp_client(int server_socket);
 
 void parameter_check(int argc, char* argv[], const char **host, const char **port, const char **mode) {
     int option;
@@ -190,54 +180,67 @@ long long evaluate_expression(char *expression, long long *result) {
     }
 }
 
-/* Function to handle incoming UDP client messages. */
-void handle_udp_client(int server_socket) {
-    struct sockaddr_in client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
-    unsigned char response_buffer[MAX_RESPONSE_SIZE];
-    size_t response_length;
-    const char *error_message = "Could not parse message";
-    const char *negative_result_msg = "Server does not support negative expression evaluations";
+void sigint_handler(int sig) {
+    (void) sig;
 
-    ssize_t recv_len = recvfrom(server_socket, response_buffer, sizeof(response_buffer) - 1, 0, (struct sockaddr *)&client_addr, &client_addr_len);
+    close_gracefully();
+}
 
-    if (recv_len < 0) {
-        perror("recvfrom() failed");
-        return;
+void close_gracefully(){
+    /* Close server socket (gracefully handles udp) */
+    close(server_socket);
+
+    /* Close connections with all active TCP clients (gracefully handles tcp) 
+       if the mode is udp, the num_clients is 0... 
+       mutex to ensure prevention of race conditions(see IOS)
+       (ensures no other thread can modify clients during this event)*/
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < num_clients; i++) {
+        send(clients[i], "BYE\n", 4, 0);
+        close(clients[i]);
     }
+    pthread_mutex_unlock(&clients_mutex);
 
-    if (recv_len < 4 || response_buffer[0] != 0x00 || recv_len - 2 != response_buffer[1]) {
-        /* Missing message codes or empty msg / Bad Opcode / Payload length wrong */
-        response_buffer[0] = 0x01; // Opcode: response
-        response_buffer[1] = 0x01; // Status code: error
-        response_buffer[2] = strlen(error_message);
-        memcpy(&response_buffer[3], error_message, response_buffer[2]);
-        response_length = 3 + response_buffer[2];
-    } else {
-        long long result;
-        if (evaluate_expression((char *)&response_buffer[2], &result) == 0 && result >= 0) {
-            response_buffer[0] = 0x01; // Opcode: response
-            response_buffer[1] = 0x00; // Status code: OK
-            response_length = snprintf((char *)&response_buffer[3], sizeof(response_buffer) - 3, "%lld", result);
-            response_buffer[2] = response_length;
-            response_length += 3;
-        } else {
-            /* Expression invalid */
-            response_buffer[0] = 0x01; // Opcode: response
-            response_buffer[1] = 0x01; // Status code: error
-            if (result < 0){
-                response_buffer[2] = strlen(negative_result_msg);
-                memcpy(&response_buffer[3], negative_result_msg, response_buffer[2]);
-            } else {
-                response_buffer[2] = strlen(error_message);
-                memcpy(&response_buffer[3], error_message, response_buffer[2]);
-            }
-            response_length = 3 + response_buffer[2];
+    exit(EXIT_SUCCESS);
+}
+
+int setup_socket(int *server_socket, const char *host, const char *port, const char *mode){
+    if (strcmp(mode, "tcp") == 0) {
+        /* Create TCP socket */
+        if ((*server_socket = socket(AF_INET, SOCK_STREAM, 0)) <= 0){
+            perror("ERROR: socket");
+            exit(EXIT_FAILURE);
+        }
+    } else if (strcmp(mode, "udp") == 0) {
+        /* Create UDP socket */
+        if ((*server_socket = socket(AF_INET, SOCK_DGRAM, 0)) <= 0){
+            perror("ERROR: socket");
+            exit(EXIT_FAILURE);
         }
     }
 
-    /* Send the message to client */
-    sendto(server_socket, response_buffer, response_length, 0, (struct sockaddr *)&client_addr, client_addr_len);
+    /* Bind the server socket to the specified address and port. */
+    struct sockaddr_in server_address;
+    memset(&server_address, 0, sizeof(server_address));
+    server_address.sin_family = AF_INET;
+    server_address.sin_addr.s_addr = inet_addr(host);
+    server_address.sin_port = htons(std::atoi(port));
+
+    if (bind(*server_socket, (struct sockaddr *)&server_address, sizeof(server_address)) == -1) {
+        perror("ERROR: bind");
+        close(*server_socket);
+        return EXIT_FAILURE;
+    }
+
+    /* Listen for incoming connections if in TCP mode. */
+    if (strcmp(mode, "tcp") == 0) {
+        if (listen(*server_socket, 5) < 0) {
+            perror("ERROR: listen() failed");
+            close(*server_socket);
+            exit(EXIT_FAILURE);
+        }
+    }
+    return 0;
 }
 
 void add_client(int client_socket) {
@@ -349,6 +352,56 @@ void *handle_tcp_client(void *arg) {
     pthread_exit(NULL);
 }
 
+/* Function to handle incoming UDP client messages. */
+void handle_udp_client(int server_socket) {
+    struct sockaddr_in client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+    unsigned char response_buffer[MAX_RESPONSE_SIZE];
+    size_t response_length;
+    const char *error_message = "Could not parse message";
+    const char *negative_result_msg = "Server does not support negative expression evaluations";
+
+    ssize_t recv_len = recvfrom(server_socket, response_buffer, sizeof(response_buffer) - 1, 0, (struct sockaddr *)&client_addr, &client_addr_len);
+
+    if (recv_len < 0) {
+        perror("recvfrom() failed");
+        return;
+    }
+
+    if (recv_len < 4 || response_buffer[0] != 0x00 || recv_len - 2 != response_buffer[1]) {
+        /* Missing message codes or empty msg / Bad Opcode / Payload length wrong */
+        response_buffer[0] = 0x01; // Opcode: response
+        response_buffer[1] = 0x01; // Status code: error
+        response_buffer[2] = strlen(error_message);
+        memcpy(&response_buffer[3], error_message, response_buffer[2]);
+        response_length = 3 + response_buffer[2];
+    } else {
+        long long result;
+        if (evaluate_expression((char *)&response_buffer[2], &result) == 0 && result >= 0) {
+            response_buffer[0] = 0x01; // Opcode: response
+            response_buffer[1] = 0x00; // Status code: OK
+            response_length = snprintf((char *)&response_buffer[3], sizeof(response_buffer) - 3, "%lld", result);
+            response_buffer[2] = response_length;
+            response_length += 3;
+        } else {
+            /* Expression invalid */
+            response_buffer[0] = 0x01; // Opcode: response
+            response_buffer[1] = 0x01; // Status code: error
+            if (result < 0){
+                response_buffer[2] = strlen(negative_result_msg);
+                memcpy(&response_buffer[3], negative_result_msg, response_buffer[2]);
+            } else {
+                response_buffer[2] = strlen(error_message);
+                memcpy(&response_buffer[3], error_message, response_buffer[2]);
+            }
+            response_length = 3 + response_buffer[2];
+        }
+    }
+
+    /* Send the message to client */
+    sendto(server_socket, response_buffer, response_length, 0, (struct sockaddr *)&client_addr, client_addr_len);
+}
+
 int main(int argc, char *argv[]) {
     const char *host; //host address (IPv4)
     const char *port; //port #
@@ -359,40 +412,7 @@ int main(int argc, char *argv[]) {
 
     /* Create server socket based on mode */
     int server_socket = -1;
-    if (strcmp(mode, "tcp") == 0) {
-        /* Create TCP socket */
-        if ((server_socket = socket(AF_INET, SOCK_STREAM, 0)) <= 0){
-            perror("ERROR: socket");
-            exit(EXIT_FAILURE);
-        }
-    } else if (strcmp(mode, "udp") == 0) {
-        /* Create UDP socket */
-        if ((server_socket = socket(AF_INET, SOCK_DGRAM, 0)) <= 0){
-            perror("ERROR: socket");
-            exit(EXIT_FAILURE);
-        }
-    }
-
-    /* Bind the server socket to the specified address and port. */
-    struct sockaddr_in server_address;
-    memset(&server_address, 0, sizeof(server_address));
-    server_address.sin_family = AF_INET;
-    server_address.sin_addr.s_addr = inet_addr(host);
-    server_address.sin_port = htons(std::atoi(port));
-
-    if (bind(server_socket, (struct sockaddr *)&server_address, sizeof(server_address)) == -1) {
-        perror("ERROR: bind");
-        close(server_socket);
-        return EXIT_FAILURE;
-    }
-
-    /* Listen for incoming connections if in TCP mode. */
-    if (strcmp(mode, "tcp") == 0) {
-        if (listen(server_socket, 5) < 0) {
-            perror("ERROR: listen() failed");
-            exit(EXIT_FAILURE);
-        }
-    }
+    setup_socket(&server_socket, host, port, mode);
 
     /* Prepare signal handler */
     signal(SIGINT, sigint_handler);
@@ -402,7 +422,6 @@ int main(int argc, char *argv[]) {
             struct sockaddr_in6 client_addr;
             socklen_t client_addr_len = sizeof(client_addr);
             int communications_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_addr_len);
-
 
             /* If accepting new connection fails */
             if (communications_socket < 0) {
@@ -432,4 +451,3 @@ int main(int argc, char *argv[]) {
         }
     }
 }
-
