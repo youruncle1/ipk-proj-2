@@ -197,6 +197,7 @@ void handle_udp_client(int server_socket) {
     unsigned char response_buffer[MAX_RESPONSE_SIZE];
     size_t response_length;
     const char *error_message = "Could not parse message";
+    const char *negative_result_msg = "Server does not support negative expression evaluations";
 
     ssize_t recv_len = recvfrom(server_socket, response_buffer, sizeof(response_buffer) - 1, 0, (struct sockaddr *)&client_addr, &client_addr_len);
 
@@ -205,8 +206,8 @@ void handle_udp_client(int server_socket) {
         return;
     }
 
-    if (recv_len < 3 || response_buffer[0] != 0x00 || recv_len - 2 != response_buffer[1]) {
-        /* Missing message codes / Bad Opcode / Payload length wrong */
+    if (recv_len < 4 || response_buffer[0] != 0x00 || recv_len - 2 != response_buffer[1]) {
+        /* Missing message codes or empty msg / Bad Opcode / Payload length wrong */
         response_buffer[0] = 0x01; // Opcode: response
         response_buffer[1] = 0x01; // Status code: error
         response_buffer[2] = strlen(error_message);
@@ -224,8 +225,13 @@ void handle_udp_client(int server_socket) {
             /* Expression invalid */
             response_buffer[0] = 0x01; // Opcode: response
             response_buffer[1] = 0x01; // Status code: error
-            response_buffer[2] = strlen(error_message);
-            memcpy(&response_buffer[3], error_message, response_buffer[2]);
+            if (result < 0){
+                response_buffer[2] = strlen(negative_result_msg);
+                memcpy(&response_buffer[3], negative_result_msg, response_buffer[2]);
+            } else {
+                response_buffer[2] = strlen(error_message);
+                memcpy(&response_buffer[3], error_message, response_buffer[2]);
+            }
             response_length = 3 + response_buffer[2];
         }
     }
@@ -253,63 +259,87 @@ void remove_client(int client_socket) {
     pthread_mutex_unlock(&clients_mutex);
 }
 
-/* Function to handle incoming TCP client connections. 
-    TODO: forum question about messages coming in chunks? */
+/* Function to handle incoming TCP client connections. */
 void *handle_tcp_client(void *arg) {
     int communications_socket = *((int *)arg);
-    char buffer[MAX_RESPONSE_SIZE];
+    char response_buffer[MAX_RESPONSE_SIZE];
     int res_len;
 
     /* Add the client to a client list */
     add_client(communications_socket);
 
-    /* finite state machine (FSM) for handling TCP communication */
+    /* Finite state machine (FSM) for handling TCP communication */
     enum TCP_FSM {
         AWAIT_HELLO,
         AWAIT_SOLVE,
         TERMINATE
     } state = AWAIT_HELLO; // starting state
 
-    while (state != TERMINATE) {
-        res_len = recv(communications_socket, buffer, MAX_RESPONSE_SIZE, 0);
+    int buffer_len = 0;
 
-        /* If the received length is less than or equal to 0, terminate the connection 
+    while (state != TERMINATE) {
+        /* Receive data and append it to the existing data in the buffer */
+        res_len = recv(communications_socket, response_buffer + buffer_len, MAX_RESPONSE_SIZE - buffer_len, 0);
+
+        /* If the received length is less than or equal to 0, terminate the connection
            handles case when client closed connection without sending BYE */
         if (res_len <= 0) {
             state = TERMINATE;
             break;
         }
 
-        buffer[res_len] = '\0';
+        buffer_len += res_len; // add length of new received data
+        response_buffer[buffer_len] = '\0'; // append null terminator at end of buffer
 
-        switch (state) {
-            case AWAIT_HELLO:
-                if (strncmp(buffer, "HELLO\n", 6) == 0) {
-                    send(communications_socket, "HELLO\n", 6, 0);
-                    state = AWAIT_SOLVE;
-                } else {
-                    state = TERMINATE;
-                }
-                break;
-            case AWAIT_SOLVE:
-                if (strncmp(buffer, "SOLVE ", 6) == 0) {
-                    long long result;
-                    if (evaluate_expression(&buffer[6], &result) == 0 && result >= 0) {
-                        char result_str[MAX_RESPONSE_SIZE]; //check ?
-                        snprintf(result_str, sizeof(result_str), "RESULT %lld\n", result);
-                        send(communications_socket, result_str, strlen(result_str), 0);
+        /* Look for the first newline character in the buffer, NULL if not present 
+           if not present, the server wont go into FSM and goes back to receive new data*/
+        char *newline_pos = strchr(response_buffer, '\n'); 
+        
+        while (newline_pos != NULL) {
+            *newline_pos = '\0'; // replace \n with null terminator
+            int message_len = newline_pos - response_buffer + 1; // message length(until \n)
+
+            switch (state) {
+                case AWAIT_HELLO:
+                    if (strcmp(response_buffer, "HELLO") == 0) {
+                        send(communications_socket, "HELLO\n", 6, 0);
+                        state = AWAIT_SOLVE;
                     } else {
-                        send(communications_socket, "BYE\n", 4, 0);
                         state = TERMINATE;
                     }
-                } else if (strncmp(buffer, "BYE\n", 4) == 0) {
+                    break;
+                case AWAIT_SOLVE:
+                    if (strncmp(response_buffer, "SOLVE ", 6) == 0) {
+                        long long result;
+                        if (evaluate_expression(&response_buffer[6], &result) == 0 && result >= 0) {
+                            char result_str[MAX_RESPONSE_SIZE];
+                            snprintf(result_str, sizeof(result_str), "RESULT %lld\n", result);
+                            send(communications_socket, result_str, strlen(result_str), 0);
+                        } else {
+                            send(communications_socket, "BYE\n", 4, 0);
+                            state = TERMINATE;
+                        }
+                    } else if (strcmp(response_buffer, "BYE") == 0) {
+                        state = TERMINATE;
+                    } else {
+                        state = TERMINATE;
+                    }
+                    break;
+                default:
                     state = TERMINATE;
-                } else {
-                    state = TERMINATE;
-                }
+            }
+
+            if (state == TERMINATE) {
                 break;
-            default:
-                state = TERMINATE;
+            }
+            /* Remove parsed data and move the remaining data in the buffer to the beginning */
+            memmove(response_buffer, newline_pos + 1, buffer_len - message_len);
+            buffer_len -= message_len;
+            newline_pos = strchr(response_buffer, '\n'); // look if there is another newline present
+        }
+        /* Check if received message is larger than aximum supported response size */
+        if (buffer_len >= MAX_RESPONSE_SIZE) {
+            state = TERMINATE;
         }
     }
 
