@@ -1,0 +1,24 @@
+complex1: PASS
+complex2: PASS
+empty_msg: PASS
+float_div: PASS
+hello_bye: PASS
+int_add: PASS
+missing_parenth: PASS
+multiple1: PASS
+multiple2: PASS
+multiple3_error: FAIL
+  Input   : (+ 1 2)
+(+ 2 3)
+(+3 4)
+(+ 4 5)
+  Expected: OK:3
+OK:5
+ERR:Could not parse message
+OK:9
+  Actual  : OK:3
+OK:5
+OK:6
+OK:9
+negative_eval: PASS
+negative_int: PASS

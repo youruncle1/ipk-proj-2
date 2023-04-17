@@ -1,0 +1,12 @@
+bad_spacing: PASS
+bye_only: PASS
+complex1: PASS
+complex2: PASS
+double_hello: PASS
+empty_msg: PASS
+float_div: PASS
+hello_bye: PASS
+int_add: PASS
+multiple1: PASS
+multiple2: PASS
+no_hello: PASS
