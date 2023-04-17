@@ -1,3 +1,8 @@
+/*
+    IPK Project 2 - IOTA: Server for Remote Calculator
+    author: Roman Poliacik
+    login: xpolia05
+*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,28 +16,46 @@
 #include <errno.h>
 #include <pthread.h>
 #include <ctype.h>
-
-char *mode; //connection mode for signal handler has to be global
+#include <iostream>
 
 #define MAX_RESPONSE_SIZE 259
+#define MAX_CLIENTS 1024
+
+int server_socket; // server socket for signal handler has to be global
+int clients[MAX_CLIENTS]; // list of active TCP client sockets
+int num_clients = 0; // number of active TCP client sockets
+pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER; // mutex to protect access to the clients list
+
 
 void sigint_handler(int sig) {
-    /* TODO */
     (void) sig;
-    exit(EXIT_FAILURE);
+
+    /* Close server socket (gracefully handles udp) */
+    close(server_socket);
+
+    /* Close connections with all active TCP clients (gracefully handles tcp) 
+       if the mode is udp, the num_clients is 0... 
+       mutex to ensure prevention of race conditions(see IOS)
+       (ensures no other thread can modify clients during this event)*/
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < num_clients; i++) {
+        send(clients[i], "BYE\n", 4, 0);
+        close(clients[i]);
+    }
+    pthread_mutex_unlock(&clients_mutex);
+
+    exit(EXIT_SUCCESS);
 }
 
-void parameter_check(int argc, char* argv[],char **host,char **port,char **mode) {
+void parameter_check(int argc, char* argv[], const char **host, const char **port, const char **mode) {
     int option;
 
-    /* Check if there is correct amount of parameters */
-    if (argc != 7) {
-        fprintf(stderr, "Usage: ipkcpc -h <host> -p <port> -m <mode>\n");
-        exit(EXIT_FAILURE);
-    }
+    /* default values*/
+    *host = "0.0.0.0";
+    *port = "2023";
+    *mode = "tcp";
 
-    /* Get parameters */
-    while ((option = getopt(argc, argv, "h:p:m:")) != -1) {
+    while ((option = getopt(argc, argv, "h:p:m:e")) != -1) {
         switch (option) {
         case 'h':
             *host = optarg;
@@ -43,15 +66,24 @@ void parameter_check(int argc, char* argv[],char **host,char **port,char **mode)
         case 'm':
             *mode = optarg;
             break;
+        case 'e':
+            std::cerr   << "Usage:\n"
+                        << "  ipkcpc [-h <host>] [-p <port>] [-m <mode>]\n"
+                        << "Parameters:\n"
+                        << "   --help            display usage information and exit\n"
+                        << "   -h <host>         host IPv4 address to listen on [default: 0.0.0.0]\n"
+                        << "   -m <mode>         server mode to use [default: tcp] [modes: tcp, udp]\n"
+                        << "   -p <port>         port number to listen on [default: 2023]\n";
+                        exit(EXIT_SUCCESS);
         default:
-            fprintf(stderr, "Usage: ipkcpc -h <host> -p <port> -m <mode>\n");
+            std::cerr << "run './ipkcpd -e' to show help\n";
             exit(EXIT_FAILURE);
         }
     }
 
     /* Check if required parameters are present */
     if (host == NULL || port == NULL || mode == NULL) {
-        fprintf(stderr, "Usage: ipkcpc -h <host> -p <port> -m <mode>\n");
+        std::cerr << "Usage: ipkcpc -h <host> -p <port> -m <mode>\n";
         exit(EXIT_FAILURE);
     }
 
@@ -59,20 +91,20 @@ void parameter_check(int argc, char* argv[],char **host,char **port,char **mode)
        https://man7.org/linux/man-pages/man3/inet_aton.3.html */
     struct in_addr addr;
     if (inet_aton(*host, &addr) == 0) {
-        fprintf(stderr, "ERROR: Invalid IPv4 address: %s\n", *host);
+        std::cerr << "ERROR: Invalid IPv4 address: " << *host << "\n";
         exit(EXIT_FAILURE);
     }
 
     /* Check if PORT is a valid number */
     long port_num = strtol(*port, nullptr, 10);
     if (port_num < 1 || port_num > 65535) {
-        fprintf(stderr, "ERROR: Invalid port number: %s\n", *port);
+        std::cerr << "ERROR: Invalid port number: "<< *port << "\n";
         exit(EXIT_FAILURE);
     }
 
     /* Check if MODE is either tcp || ucp */
     if (strcmp(*mode, "tcp") != 0 && strcmp(*mode, "udp") != 0) {
-        fprintf(stderr, "ERROR: mode must be either tcp or udp");
+        std::cerr << "ERROR: mode must be either tcp or udp\n";
         exit(EXIT_FAILURE);
     }
 }
@@ -158,15 +190,145 @@ long long evaluate_expression(char *expression, long long *result) {
     }
 }
 
-int main(int argc, char *argv[]) {
-    char *host; //host address (IPv4)
-    char *port; //port #
+/* Function to handle incoming UDP client messages. */
+void handle_udp_client(int server_socket) {
+    struct sockaddr_in client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+    unsigned char response_buffer[MAX_RESPONSE_SIZE];
+    size_t response_length;
+    const char *error_message = "Could not parse message";
 
-    /* Parse command line arguments and initialize variables. */
+    ssize_t recv_len = recvfrom(server_socket, response_buffer, sizeof(response_buffer) - 1, 0, (struct sockaddr *)&client_addr, &client_addr_len);
+
+    if (recv_len < 0) {
+        perror("recvfrom() failed");
+        return;
+    }
+
+    if (recv_len < 3 || response_buffer[0] != 0x00 || recv_len - 2 != response_buffer[1]) {
+        /* Missing message codes / Bad Opcode / Payload length wrong */
+        response_buffer[0] = 0x01; // Opcode: response
+        response_buffer[1] = 0x01; // Status code: error
+        response_buffer[2] = strlen(error_message);
+        memcpy(&response_buffer[3], error_message, response_buffer[2]);
+        response_length = 3 + response_buffer[2];
+    } else {
+        long long result;
+        if (evaluate_expression((char *)&response_buffer[2], &result) == 0 && result >= 0) {
+            response_buffer[0] = 0x01; // Opcode: response
+            response_buffer[1] = 0x00; // Status code: OK
+            response_length = snprintf((char *)&response_buffer[3], sizeof(response_buffer) - 3, "%lld", result);
+            response_buffer[2] = response_length;
+            response_length += 3;
+        } else {
+            /* Expression invalid */
+            response_buffer[0] = 0x01; // Opcode: response
+            response_buffer[1] = 0x01; // Status code: error
+            response_buffer[2] = strlen(error_message);
+            memcpy(&response_buffer[3], error_message, response_buffer[2]);
+            response_length = 3 + response_buffer[2];
+        }
+    }
+
+    /* Send the message to client */
+    sendto(server_socket, response_buffer, response_length, 0, (struct sockaddr *)&client_addr, client_addr_len);
+}
+
+void add_client(int client_socket) {
+    pthread_mutex_lock(&clients_mutex);
+    if (num_clients < MAX_CLIENTS) {
+        clients[num_clients++] = client_socket;
+    }
+    pthread_mutex_unlock(&clients_mutex);
+}
+
+void remove_client(int client_socket) {
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < num_clients; i++) {
+        if (clients[i] == client_socket) {
+            clients[i] = clients[--num_clients];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+}
+
+/* Function to handle incoming TCP client connections. 
+    TODO: forum question about messages coming in chunks? */
+void *handle_tcp_client(void *arg) {
+    int communications_socket = *((int *)arg);
+    char buffer[MAX_RESPONSE_SIZE];
+    int res_len;
+
+    /* Add the client to a client list */
+    add_client(communications_socket);
+
+    /* finite state machine (FSM) for handling TCP communication */
+    enum TCP_FSM {
+        AWAIT_HELLO,
+        AWAIT_SOLVE,
+        TERMINATE
+    } state = AWAIT_HELLO; // starting state
+
+    while (state != TERMINATE) {
+        res_len = recv(communications_socket, buffer, MAX_RESPONSE_SIZE, 0);
+
+        /* If the received length is less than or equal to 0, terminate the connection 
+           handles case when client closed connection without sending BYE */
+        if (res_len <= 0) {
+            state = TERMINATE;
+            break;
+        }
+
+        buffer[res_len] = '\0';
+
+        switch (state) {
+            case AWAIT_HELLO:
+                if (strncmp(buffer, "HELLO\n", 6) == 0) {
+                    send(communications_socket, "HELLO\n", 6, 0);
+                    state = AWAIT_SOLVE;
+                } else {
+                    state = TERMINATE;
+                }
+                break;
+            case AWAIT_SOLVE:
+                if (strncmp(buffer, "SOLVE ", 6) == 0) {
+                    long long result;
+                    if (evaluate_expression(&buffer[6], &result) == 0 && result >= 0) {
+                        char result_str[MAX_RESPONSE_SIZE]; //check ?
+                        snprintf(result_str, sizeof(result_str), "RESULT %lld\n", result);
+                        send(communications_socket, result_str, strlen(result_str), 0);
+                    } else {
+                        send(communications_socket, "BYE\n", 4, 0);
+                        state = TERMINATE;
+                    }
+                } else if (strncmp(buffer, "BYE\n", 4) == 0) {
+                    state = TERMINATE;
+                } else {
+                    state = TERMINATE;
+                }
+                break;
+            default:
+                state = TERMINATE;
+        }
+    }
+
+    send(communications_socket, "BYE\n", 4, 0);
+    close(communications_socket);
+    remove_client(communications_socket); // if successfully terminated, remove client from list of active TCP clients
+    pthread_exit(NULL);
+}
+
+int main(int argc, char *argv[]) {
+    const char *host; //host address (IPv4)
+    const char *port; //port #
+    const char *mode; //connection mode 
+
+    /* Parse command line arguments and initialize host, port and mode. */
     parameter_check(argc, argv, &host, &port, &mode);
 
     /* Create server socket based on mode */
-    int server_socket;
+    int server_socket = -1;
     if (strcmp(mode, "tcp") == 0) {
         /* Create TCP socket */
         if ((server_socket = socket(AF_INET, SOCK_STREAM, 0)) <= 0){
@@ -179,9 +341,6 @@ int main(int argc, char *argv[]) {
             perror("ERROR: socket");
             exit(EXIT_FAILURE);
         }
-    } else {
-        fprintf(stderr, "Invalid mode: %s\n", mode);
-        exit(EXIT_FAILURE);
     }
 
     /* Bind the server socket to the specified address and port. */
@@ -197,7 +356,7 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-        // Listen for incoming connections if in TCP mode.
+    /* Listen for incoming connections if in TCP mode. */
     if (strcmp(mode, "tcp") == 0) {
         if (listen(server_socket, 5) < 0) {
             perror("ERROR: listen() failed");
@@ -212,113 +371,35 @@ int main(int argc, char *argv[]) {
         if (strcmp(mode, "tcp") == 0) {
             struct sockaddr_in6 client_addr;
             socklen_t client_addr_len = sizeof(client_addr);
-            int communication_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_addr_len);
+            int communications_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_addr_len);
 
-            if (communication_socket < 0) {
+
+            /* If accepting new connection fails */
+            if (communications_socket < 0) {
                 perror("accept() failed");
                 continue;
             }
 
-            char buffer[MAX_RESPONSE_SIZE];
-            int res_len;
-
-            enum State {
-                AWAIT_HELLO,
-                AWAIT_SOLVE,
-                TERMINATE
-            } state = AWAIT_HELLO;
-
-            while (state != TERMINATE) {
-                res_len = recv(communication_socket, buffer, MAX_RESPONSE_SIZE, 0);
-
-                if (res_len <= 0) {
-                    state = TERMINATE;
-                    break;
-                }
-
-                buffer[res_len] = '\0';
-
-                switch (state) {
-                    case AWAIT_HELLO:
-                        if (strncmp(buffer, "HELLO\n", 6) == 0) {
-                            send(communication_socket, "HELLO\n", 6, 0);
-                            state = AWAIT_SOLVE;
-                        } else {
-                            state = TERMINATE;
-                        }
-                        break;
-                    case AWAIT_SOLVE:
-                        if (strncmp(buffer, "SOLVE ", 6) == 0) {
-                            long long result;
-                            if (evaluate_expression(&buffer[6], &result) == 0 && result >= 0) {
-                                char result_str[1024];
-                                snprintf(result_str, sizeof(result_str), "RESULT %lld\n", result);
-                                send(communication_socket, result_str, strlen(result_str), 0);
-                            } else {
-                                send(communication_socket, "BYE\n", 4, 0);
-                                state = TERMINATE;
-                            }
-                        } else if (strncmp(buffer, "BYE\n", 4) == 0) {
-                            state = TERMINATE;
-                        } else {
-                            state = TERMINATE;
-                        }
-                        break;
-                    default:
-                        state = TERMINATE;
-                }
-            }
-
-            send(communication_socket, "BYE\n", 4, 0);
-            close(communication_socket);
-
-        } else if (strcmp(mode, "udp") == 0) {
-            struct sockaddr_in client_addr;
-            socklen_t client_addr_len = sizeof(client_addr);
-            unsigned char response_buffer[MAX_RESPONSE_SIZE];
-            size_t response_length;
-            const char *error_message = "Could not parse message";
-
-            ssize_t recv_len = recvfrom(server_socket, response_buffer, sizeof(response_buffer) - 1, 0, (struct sockaddr *)&client_addr, &client_addr_len);
-
-            if (recv_len < 0) {
-                perror("recvfrom() failed");
+            /*  Create a new thread using pthread to handle new tcp connection */
+            pthread_t thread_id;
+            if (pthread_create(&thread_id, NULL, handle_tcp_client, &communications_socket) != 0) {
+                /* if creating new thread fails, close the communication and move on with life */
+                perror("pthread_create() failed");
+                close(communications_socket);
                 continue;
             }
 
-            if (recv_len < 3 || response_buffer[0] != 0x00 || recv_len - 2 != response_buffer[1]) {
-                /* Wrong message format / Bad Opcode / Payload length wrong */
-                response_buffer[0] = 0x01; // Opcode: response
-                response_buffer[1] = 0x01; // Status code: error  
-                response_buffer[2] = strlen(error_message);
-                memcpy(&response_buffer[3], error_message, response_buffer[2]);
-                response_length = 3 + response_buffer[2];
-            } else {
-                long long result;
-                if (evaluate_expression((char *)&response_buffer[2], &result) == 0 && result >= 0) {
-                    response_buffer[0] = 0x01; // Opcode: response
-                    response_buffer[1] = 0x00; // Status code: OK
-                    //https://forum.arduino.cc/t/issues-creating-a-library-with-char-arrays/853215
-                    response_length = snprintf((char *)&response_buffer[3], sizeof(response_buffer) - 3, "%lld", result);
-                    response_buffer[2] = response_length;
-                    response_length += 3;
-                } else {
-                    /* Expression invalid */
-                    response_buffer[0] = 0x01; // Opcode: response
-                    response_buffer[1] = 0x01; // Status code: error
-                    response_buffer[2] = strlen(error_message);
-                    memcpy(&response_buffer[3], error_message, response_buffer[2]);
-                    response_length = 3 + response_buffer[2];
-                }
+            /* detach allows resources to be reclaimed by system when thread exits(stops execution), 
+                and also benefits the server program by running the thread independently
+                (program does not need to wait for return value of thread to continue)             */
+            if (pthread_detach(thread_id) != 0) {
+                perror("pthread_detach() failed");
+                close(communications_socket);
+                continue;
             }
-            
-            /* Send the message to client */
-            sendto(server_socket, response_buffer, response_length, 0, (struct sockaddr *)&client_addr, client_addr_len);
-
+        } else if (strcmp(mode, "udp") == 0) {
+            handle_udp_client(server_socket);
         }
     }
-    /* Close the server socket and exit (should not happen now anyways) */
-    close(server_socket);
-    exit(EXIT_SUCCESS);
 }
 
