@@ -101,7 +101,10 @@ To handle chunks of data, the function behaves like this:
 Handles incoming UDP client messages. It processes client messages, evaluates the received arithmetic expressions, and sends the result back to the client. In case of an invalid or negative expression evaluation, an error message is sent to the client. This function does not require tracking client connections as the UDP protocol is connectionless, allowing for more straightforward message processing and response.
 
 ## Testing 
-TO ADD
+For the purpose of testing, an testing script was implemented. which can be executed as __./test.sh__.
+The script iterates over test cases in folder tests, based on the mode selected in script source code, it sends input either through ipkcpc client program in UDP mode(used client from project 1, which passed all tests - I found it suitable to test the server), or netcat for TCP mode. As for netcat, it behaves differently from ipkcpc client, and does not output BYE after sending BYE to server, so the test cases have look a bit different. The output of tests with names of testcases can be found in files `test_logUDP.txt` and `test_logTCP.txt`.
+During testing, I found out I have shortcomings in expression evaluation, as expression `(+3 4)` evaluates as valid in my server, even though it should not. If I were to test my server sooner, I could have had the time to fix it.
+
 ## BIBLIOGRAPHY
 
 - Vladimir Vesely DemoTcp [online]. Publisher: Brno University of Technology, Faculty of Information Technology, January 30th 2023. [cit. 2023-17-04]. Available at: https://git.fit.vutbr.cz/NESFIT/IPK-Projekty/src/branch/master/Stubs/cpp/DemoTcp. 
